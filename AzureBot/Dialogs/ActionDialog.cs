@@ -42,7 +42,8 @@
             string message = "Hello! You can use the Azure Bot to: \n";
             message += $"* List, Switch and Select an Azure subscription\n";
             message += $"* List, Start, Shutdown (power off your VM, still incurring compute charges), and Stop (deallocates your VM, no charges) your virtual machines\n";
-            message += $"* Start a runbook\n";
+            message += $"* List your automation accounts\n";
+            message += $"* Start a runbook and get the status of the runbook jobs\n";
             message += $"* Logout to sign out from Azure\n\n";
             message += $"Please type **login** to interact with me for the first time.";
             
@@ -161,7 +162,7 @@
                      string.Empty,
                     (current, next) =>
                     {
-                        return current += $"\n\r• {next.Name} ({next.PowerState})";
+                        return current += $"\n\r• {next}";
                     });
 
                 await context.PostAsync($"Available VMs are:\r\n {virtualMachinesText}");
@@ -192,8 +193,8 @@
             await this.ProcessVirtualMachineActionAsync(context, result, Operations.Shutdown, this.ShutdownVirtualMachineFormComplete);
         }
 
-        [LuisIntent("RunRunbook")]
-        public async Task StartRunbookAsync(IDialogContext context, LuisResult result)
+        [LuisIntent("ListAutomationAccounts")]
+        public async Task ListAutomationAccountsAsync(IDialogContext context, LuisResult result)
         {
             var accessToken = await context.GetAccessToken(resourceId.Value);
             if (string.IsNullOrEmpty(accessToken))
@@ -203,7 +204,95 @@
 
             var subscriptionId = context.GetSubscriptionId();
 
+            var automationAccounts = await new AzureRepository().ListAutomationAccountsAsync(accessToken, subscriptionId);
+            if (automationAccounts.Any())
+            {
+                var automationAccountsText = automationAccounts.Aggregate(
+                     string.Empty,
+                    (current, next) =>
+                    {
+                        return current += $"\n\r• {next.AutomationAccountName}";
+                    });
+
+                await context.PostAsync($"Available automations accounts are:\r\n {automationAccountsText}");
+            }
+            else
+            {
+                await context.PostAsync("No automations accounts were found in the current subscription.");
+            }
+
+            context.Wait(this.MessageReceived);
+        }
+
+        [LuisIntent("RunRunbook")]
+        public async Task StartRunbookAsync(IDialogContext context, LuisResult result)
+        {
+            EntityRecommendation runbookEntity;
+            var accessToken = await context.GetAccessToken(resourceId.Value);
+            if (string.IsNullOrEmpty(accessToken))
+            {
+                return;
+            }
+
+            var subscriptionId = context.GetSubscriptionId();
+
             var availableAutomationAccounts = await new AzureRepository().ListRunbooksAsync(accessToken, subscriptionId);
+
+            // check if the user specified a runbook name in the command
+            if (result.TryFindEntity("Runbook", out runbookEntity))
+            {
+                // obtain the name specified by the user - text in LUIS result is different
+                var runbookName = runbookEntity.GetEntityOriginalText(result.Query);
+
+                EntityRecommendation automationAccountEntity;
+
+                if (result.TryFindEntity("AutomationAccount", out automationAccountEntity))
+                {
+                    // obtain the name specified by the user - text in LUIS result is different
+                    var automationAccountName = automationAccountEntity.GetEntityOriginalText(result.Query);
+
+                    var selectedAutomationAccount = availableAutomationAccounts.SingleOrDefault(x => x.AutomationAccountName.Equals(automationAccountName, StringComparison.InvariantCultureIgnoreCase));
+
+                    if (selectedAutomationAccount == null)
+                    {
+                        await context.PostAsync($"The '{automationAccountName}' automation account was not found in the current subscription");
+                        context.Wait(this.MessageReceived);
+                        return;
+                    }
+
+                    // ensure that the runbook exists in the specified automation account
+                    if (!selectedAutomationAccount.Runbooks.Any(x => x.RunbookName.Equals(runbookName, StringComparison.InvariantCultureIgnoreCase)))
+                    {
+                        await context.PostAsync($"The '{runbookName}' runbook was not found in the '{automationAccountName}' automation account.");
+                        context.Wait(this.MessageReceived);
+                        return;
+                    }
+
+                    runbookEntity.Entity = runbookName;
+                    runbookEntity.Type = "RunbookName";
+
+                    automationAccountEntity.Entity = selectedAutomationAccount.AutomationAccountName;
+                    automationAccountEntity.Type = "AutomationAccountName";
+                }
+                else
+                {
+                    // ensure that the runbook exists in at least one of the automation accounts
+                    var selectedAutomationAccounts = availableAutomationAccounts.Where(x => x.Runbooks.Any(r => r.RunbookName.Equals(runbookName, StringComparison.InvariantCultureIgnoreCase)));
+
+                    if (selectedAutomationAccounts == null || !selectedAutomationAccounts.Any())
+                    {
+                        await context.PostAsync($"The '{runbookName}' runbook was not found in any of your automation accounts.");
+                        context.Wait(this.MessageReceived);
+                        return;
+                    }
+
+                    runbookEntity.Entity = runbookName;
+                    runbookEntity.Type = "RunbookName";
+
+                    // todo: handle runbooks with same name in different automation accounts
+                    availableAutomationAccounts = selectedAutomationAccounts.ToList();
+                }
+            }
 
             if (availableAutomationAccounts.Any())
             {
@@ -223,7 +312,7 @@
             }
             else
             {
-                await context.PostAsync($"No automations accounts were found in the current subscription.");
+                await context.PostAsync($"No automations accounts were found in the current subscription. Please create an Azure automation account or switch to a subscription which has an automation account in it.");
                 context.Wait(this.MessageReceived);
             }
         }
@@ -316,6 +405,7 @@
         private static async Task CheckLongRunningOperationStatus<T>(
             IDialogContext context,
             RunbookJob runbookJob,
+            string accessToken,
             Func<string, string, string, string, string, bool, Task<T>> getOperationStatusAsync,
             Func<T, bool> completionCondition,
             Func<T, T, string> getOperationStatusMessage,
@@ -324,7 +414,6 @@
             var lastOperationStatus = default(T);
             do
             {
-                var accessToken = await context.GetAccessToken(resourceId.Value).ConfigureAwait(false);
                 var subscriptionId = context.GetSubscriptionId();
 
                 var newOperationStatus = await getOperationStatusAsync(accessToken, subscriptionId, runbookJob.ResourceGroupName, runbookJob.AutomationAccountName, runbookJob.JobId, true).ConfigureAwait(false);
@@ -461,23 +550,41 @@
 
                 await context.PostAsync($"Created Job '{runbookJob.JobId}' for the '{runbookFormState.RunbookName}' runbook in '{runbookFormState.AutomationAccountName}' automation account. You'll receive a message when it is completed.");
 
-                var notifyStatusList = new List<string> { "Running", "Completed", "Failed" };
+                var notCompletedStatusList = new List<string> { "Stopped", "Suspended", "Failed" };
+                var notifyStatusList = new List<string> { "Running", "Completed" };
+                notifyStatusList.AddRange(notCompletedStatusList);
 
-                // no wait, just fire and forget
+                accessToken = await context.GetAccessToken(resourceId.Value);
+
+                if (string.IsNullOrEmpty(accessToken))
+                {
+                    return;
+                }
+
+#pragma warning disable CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
                 CheckLongRunningOperationStatus(
                     context,
                     runbookJob,
+                    accessToken,
                     new AzureRepository().GetAutomationJobAsync,
                     rj => rj.EndDateTime.HasValue,
                     (previous, last) =>
                     {
                         if (!string.Equals(previous?.Status, last?.Status) && notifyStatusList.Contains(last.Status))
                         {
-                            return $"Runbook '{last.RunbookName}' job '{last.JobId}' is currently in '{last.Status}' status.";
+                            if (notCompletedStatusList.Contains(last.Status))
+                            {
+                                return $"The runbook '{last.RunbookName}' (job '{last.JobId}') did not complete with status '{last.Status}'. Please go to the Azure Portal for more detailed information on why.";
+                            }
+                            else
+                            {
+                                return $"Runbook '{last.RunbookName}' job '{last.JobId}' is currently in '{last.Status}' status.";
+                            }
                         }
 
                         return null;
                     });
+#pragma warning restore CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
             }
             catch (Exception e)
             {
